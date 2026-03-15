@@ -1,6 +1,7 @@
 """
 BanglaBias Annotation Tool
 Interactive Streamlit app for political stance labeling of Bangla news articles.
+Supports sentence-level labeling and span-level text highlighting.
 """
 
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from text_highlighter import text_highlighter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -28,6 +30,11 @@ LABEL_DISPLAY = {
     "neutral": "Neutral",
     "unlabeled": "Unlabeled",
 }
+HIGHLIGHTER_LABELS = [
+    ("Govt Leaning", "#22c55e"),
+    ("Govt Critique", "#ef4444"),
+    ("Neutral", "#3b82f6"),
+]
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 STATE_PATH = DATA_DIR / "annotations_state.json"
 
@@ -78,6 +85,7 @@ def csv_to_articles(df: pd.DataFrame) -> list[dict]:
                 {"id": i, "text": s, "label": "unlabeled"}
                 for i, s in enumerate(sentences)
             ],
+            "highlights": [],
         })
     return articles
 
@@ -184,26 +192,7 @@ CUSTOM_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Bengali:wght@400;600;700&display=swap');
 
-/* Sentence buttons: make them look like colored blocks */
-.stMainBlockContainer [data-testid="stVerticalBlock"] .sentence-btn-wrap button {
-    text-align: left !important;
-    justify-content: flex-start !important;
-    font-family: 'Noto Sans Bengali', sans-serif !important;
-    font-size: 15px !important;
-    padding: 10px 14px !important;
-    white-space: normal !important;
-    word-wrap: break-word !important;
-    line-height: 1.6 !important;
-    min-height: 44px !important;
-    border-radius: 6px !important;
-    transition: all 0.15s ease !important;
-}
-.stMainBlockContainer [data-testid="stVerticalBlock"] .sentence-btn-wrap button:hover {
-    filter: brightness(0.93) !important;
-}
-.stMainBlockContainer [data-testid="stVerticalBlock"] .sentence-btn-wrap button p {
-    text-align: left !important;
-}
+/* Per-sentence button CSS is injected dynamically in render_sentence_panel */
 .article-meta {
     font-family: 'Noto Sans Bengali', sans-serif;
     display: flex;
@@ -228,10 +217,6 @@ CUSTOM_CSS = """
     font-size: 13px;
     font-weight: 600;
 }
-.selected-sentence {
-    outline: 3px solid #f59e0b;
-    outline-offset: 1px;
-}
 
 /* Article label button styling */
 div[data-testid="stHorizontalBlock"] button {
@@ -241,8 +226,200 @@ div[data-testid="stHorizontalBlock"] button {
     border-radius: 8px !important;
     transition: all 0.15s ease !important;
 }
+
+/* Text highlighter container */
+.highlight-container {
+    font-family: 'Noto Sans Bengali', sans-serif;
+    font-size: 16px;
+    line-height: 2;
+}
 </style>
 """
+
+
+# ---------------------------------------------------------------------------
+# Sentence annotation panel (st.button based — reliable click handling)
+# ---------------------------------------------------------------------------
+
+def render_sentence_panel(article: dict, state: dict):
+    """Render the sentence-level annotation panel using st.button per sentence."""
+    sents = article.get("sentences", [])
+    if not sents:
+        st.caption("No sentences found in this article.")
+        return
+
+    selected_sid = st.session_state.selected_sentence
+
+    # Consolidate all per-sentence CSS into a single style block
+    css_rules = []
+    for sent in sents:
+        sid = sent["id"]
+        scolor = LABEL_COLORS[sent.get("label", "unlabeled")]
+        is_selected = (selected_sid == sid)
+        outline = (
+            f"outline: 3px solid #f59e0b; outline-offset: 2px; "
+            f"box-shadow: 0 0 8px rgba(245,158,11,0.3);"
+            if is_selected else ""
+        )
+        css_rules.append(
+            f'.sent-{sid} button {{'
+            f'  background: {scolor}18 !important;'
+            f'  border-left: 5px solid {scolor} !important;'
+            f'  text-align: left !important;'
+            f'  justify-content: flex-start !important;'
+            f'  font-family: "Noto Sans Bengali", sans-serif !important;'
+            f'  font-size: 15px !important;'
+            f'  padding: 10px 14px !important;'
+            f'  white-space: normal !important;'
+            f'  word-wrap: break-word !important;'
+            f'  line-height: 1.8 !important;'
+            f'  min-height: 44px !important;'
+            f'  border-radius: 8px !important;'
+            f'  margin-bottom: 2px !important;'
+            f'  {outline}'
+            f'}}'
+            f'.sent-{sid} button:hover {{'
+            f'  background: {scolor}30 !important;'
+            f'  filter: brightness(0.95) !important;'
+            f'}}'
+            f'.sent-{sid} button p {{'
+            f'  text-align: left !important;'
+            f'}}'
+        )
+    st.markdown(f'<style>{"".join(css_rules)}</style>', unsafe_allow_html=True)
+
+    # Render each sentence as a clickable button
+    for sent in sents:
+        sid = sent["id"]
+        slabel = sent.get("label", "unlabeled")
+        scolor = LABEL_COLORS[slabel]
+        is_selected = (selected_sid == sid)
+
+        # Wrap each button in a div with a per-sentence CSS class
+        st.markdown(f'<div class="sent-{sid}">', unsafe_allow_html=True)
+        btn_text = f"#{sid}  {sent['text']}  [{LABEL_DISPLAY[slabel]}]"
+        if st.button(btn_text, key=f"sent_select_{sid}", use_container_width=True):
+            if is_selected:
+                st.session_state.selected_sentence = -1
+            else:
+                st.session_state.selected_sentence = sid
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Show inline label buttons if this sentence is selected
+        if is_selected:
+            sl_cols = st.columns(5)
+            sent_labels = [
+                ("govt_leaning", "Govt Leaning"),
+                ("govt_critique", "Govt Critique"),
+                ("neutral", "Neutral"),
+                ("unlabeled", "Clear"),
+            ]
+            current_slabel = sent.get("label", "unlabeled")
+            for j, (sl_key, sl_text) in enumerate(sent_labels):
+                with sl_cols[j]:
+                    is_current = (current_slabel == sl_key)
+                    if st.button(
+                        f"● {sl_text}" if is_current else sl_text,
+                        key=f"sent_label_{sid}_{sl_key}",
+                        use_container_width=True,
+                        type="primary" if is_current else "secondary",
+                    ):
+                        sent["label"] = sl_key
+                        save_state(state)
+                        st.session_state.selected_sentence = -1
+                        st.rerun()
+            with sl_cols[4]:
+                if st.button("Close", key=f"sent_close_{sid}",
+                             use_container_width=True, type="secondary"):
+                    st.session_state.selected_sentence = -1
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Text highlighting panel
+# ---------------------------------------------------------------------------
+
+def render_highlight_panel(article: dict, state: dict, real_idx: int):
+    """Render the span-level text highlighting panel."""
+    body = article.get("news_body", "")
+    if not body.strip():
+        st.caption("No article body text available.")
+        return
+
+    st.markdown(
+        "Select text with your mouse, pick a label, and the highlight will be saved. "
+        "Existing highlights are shown in color."
+    )
+
+    # Load existing highlights for this article
+    existing = article.get("highlights", [])
+
+    # Convert stored highlights to text-highlighter format (start/end/tag only)
+    annotations = [
+        {"start": h["start"], "end": h["end"], "tag": h["tag"]}
+        for h in existing
+    ]
+
+    result = text_highlighter(
+        text=body,
+        labels=HIGHLIGHTER_LABELS,
+        annotations=annotations if len(annotations) > 0 else None,
+        key=f"highlighter_{real_idx}",
+        show_label_selector=True,
+    )
+
+    # Save highlights when they change
+    if result is not None and len(result) > 0:
+        new_highlights = []
+        for ann in result:
+            start = int(ann.get("start", 0) if isinstance(ann, dict) else getattr(ann, "start", 0))
+            end = int(ann.get("end", 0) if isinstance(ann, dict) else getattr(ann, "end", 0))
+            tag = str(ann.get("tag", "") if isinstance(ann, dict) else getattr(ann, "tag", ""))
+            new_highlights.append({
+                "start": start,
+                "end": end,
+                "tag": tag,
+                "text": body[start:end],
+            })
+
+        # Compare by normalized tuples to avoid format mismatch
+        existing_set = {(h["start"], h["end"], h["tag"]) for h in existing}
+        new_set = {(h["start"], h["end"], h["tag"]) for h in new_highlights}
+        if new_set != existing_set:
+            article["highlights"] = new_highlights
+            save_state(state)
+    elif result is not None and len(result) == 0 and len(existing) > 0:
+        # User cleared all highlights via the component
+        article["highlights"] = []
+        save_state(state)
+
+    # Show highlight summary
+    highlights = article.get("highlights", [])
+    if highlights:
+        st.markdown("---")
+        st.markdown(f"**Highlights ({len(highlights)}):**")
+        for i, h in enumerate(highlights):
+            tag = h.get("tag", "Unknown")
+            text = h.get("text", body[h["start"]:h["end"]])
+            # Find color for this tag
+            tag_color = "#9ca3af"
+            for lbl_name, lbl_color in HIGHLIGHTER_LABELS:
+                if lbl_name == tag:
+                    tag_color = lbl_color
+                    break
+            st.markdown(
+                f'<div style="padding:6px 10px; margin:3px 0; border-left:3px solid {tag_color}; '
+                f'background:{tag_color}15; border-radius:4px; font-family: Noto Sans Bengali, sans-serif;">'
+                f'<span style="font-size:11px; color:{tag_color}; font-weight:600;">[{tag}]</span> '
+                f'{text}</div>',
+                unsafe_allow_html=True,
+            )
+
+        if st.button("Clear All Highlights", key="clear_highlights", type="secondary"):
+            article["highlights"] = []
+            save_state(state)
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +597,10 @@ def main():
     real_idx = indices[idx]
     article = articles[real_idx]
 
+    # Ensure highlights field exists (for older state files)
+    if "highlights" not in article:
+        article["highlights"] = []
+
     # ----- Article Header -----
     meta_html = f"""
     <div class="article-meta">
@@ -436,17 +617,19 @@ def main():
     st.markdown(meta_html, unsafe_allow_html=True)
 
     # ----- Navigation Row -----
+    def _navigate(new_idx):
+        """Navigate to a new article index, clearing selection state."""
+        st.session_state.current_idx = new_idx
+        st.session_state.selected_sentence = -1
+        st.rerun()
+
     nav_cols = st.columns([1, 1, 2, 1, 1])
     with nav_cols[0]:
         if st.button("◀ Prev", use_container_width=True, disabled=(idx == 0)):
-            st.session_state.current_idx -= 1
-            st.session_state.selected_sentence = -1
-            st.rerun()
+            _navigate(idx - 1)
     with nav_cols[1]:
         if st.button("Next ▶", use_container_width=True, disabled=(idx >= total - 1)):
-            st.session_state.current_idx += 1
-            st.session_state.selected_sentence = -1
-            st.rerun()
+            _navigate(idx + 1)
     with nav_cols[2]:
         st.markdown(
             f"<div style='text-align:center; padding:8px; font-size:16px;'>"
@@ -457,9 +640,7 @@ def main():
         goto = st.number_input("Go to #", min_value=1, max_value=max(total, 1), value=idx + 1, step=1, key="goto_input", label_visibility="collapsed")
     with nav_cols[4]:
         if st.button("Go", use_container_width=True):
-            st.session_state.current_idx = int(goto) - 1
-            st.session_state.selected_sentence = -1
-            st.rerun()
+            _navigate(int(goto) - 1)
 
     st.divider()
 
@@ -480,18 +661,12 @@ def main():
             is_active = (current_label == lbl_key)
             color = LABEL_COLORS[lbl_key]
 
-            if is_active and lbl_key != "unlabeled":
+            if is_active:
+                display = lbl_text if lbl_key != "unlabeled" else "Unlabeled"
                 st.markdown(
                     f"<div style='background:{color}; color:#fff; text-align:center; "
                     f"padding:8px 16px; border-radius:8px; font-weight:700; font-size:15px; "
-                    f"margin-bottom:4px;'>{lbl_text} ✓</div>",
-                    unsafe_allow_html=True,
-                )
-            elif is_active and lbl_key == "unlabeled":
-                st.markdown(
-                    f"<div style='background:{color}; color:#fff; text-align:center; "
-                    f"padding:8px 16px; border-radius:8px; font-weight:700; font-size:15px; "
-                    f"margin-bottom:4px;'>Unlabeled ✓</div>",
+                    f"margin-bottom:4px;'>{display} ✓</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -515,74 +690,19 @@ def main():
 
     st.divider()
 
-    # ----- Sentences Panel -----
-    st.markdown("**Sentences** (click a sentence to label it)")
+    # ----- Tabbed Annotation Panels -----
+    tab_sent, tab_highlight = st.tabs([
+        "Sentence Annotation",
+        "Text Highlighting",
+    ])
 
-    sents = article.get("sentences", [])
-    if not sents:
-        st.caption("No sentences found in this article.")
-    else:
-        for sent in sents:
-            sid = sent["id"]
-            slabel = sent.get("label", "unlabeled")
-            scolor = LABEL_COLORS[slabel]
-            is_selected = (st.session_state.selected_sentence == sid)
+    with tab_sent:
+        st.markdown("Click a sentence to label it.")
+        render_sentence_panel(article, state)
 
-            # Inject per-sentence color styling + make the button the sentence
-            outline = "outline:3px solid #f59e0b; outline-offset:2px;" if is_selected else ""
-            st.markdown(
-                f'<style>'
-                f'.sent-btn-{sid} button {{'
-                f'  background: {scolor}18 !important;'
-                f'  border-left: 4px solid {scolor} !important;'
-                f'  {outline}'
-                f'}}'
-                f'.sent-btn-{sid} button:hover {{'
-                f'  background: {scolor}30 !important;'
-                f'}}'
-                f'</style>'
-                f'<div class="sentence-btn-wrap sent-btn-{sid}">',
-                unsafe_allow_html=True,
-            )
-
-            # The sentence itself is the clickable element
-            btn_text = f"#{sid}  {sent['text']}  [{LABEL_DISPLAY[slabel]}]"
-            if st.button(
-                btn_text,
-                key=f"sent_select_{sid}",
-                use_container_width=True,
-            ):
-                if is_selected:
-                    st.session_state.selected_sentence = -1
-                else:
-                    st.session_state.selected_sentence = sid
-                st.rerun()
-
-            # Close the wrapper div
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # Show inline label buttons if this sentence is selected
-            if is_selected:
-                sl_cols = st.columns(4)
-                sent_labels = [
-                    ("govt_leaning", "Govt Leaning"),
-                    ("govt_critique", "Govt Critique"),
-                    ("neutral", "Neutral"),
-                    ("unlabeled", "Clear"),
-                ]
-                for j, (sl_key, sl_text) in enumerate(sent_labels):
-                    with sl_cols[j]:
-                        is_current = (slabel == sl_key)
-                        if st.button(
-                            f"● {sl_text}" if is_current else sl_text,
-                            key=f"sent_label_{sid}_{sl_key}",
-                            use_container_width=True,
-                            type="primary" if is_current else "secondary",
-                        ):
-                            sent["label"] = sl_key
-                            save_state(state)
-                            st.session_state.selected_sentence = -1
-                            st.rerun()
+    with tab_highlight:
+        st.markdown("Highlight text spans in the article body and assign labels.")
+        render_highlight_panel(article, state, real_idx)
 
 
 # ---------------------------------------------------------------------------
